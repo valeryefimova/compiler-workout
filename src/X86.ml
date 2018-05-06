@@ -90,24 +90,92 @@ open SM
    Take an environment, a stack machine program, and returns a pair --- the updated environment and the list
    of x86 instructions
 *)
-let compile env code =
-  let suffix = function
+let suffix = function
   | "<"  -> "l"
   | "<=" -> "le"
   | "==" -> "e"
   | "!=" -> "ne"
   | ">=" -> "ge"
   | ">"  -> "g"
-  | _    -> failwith "unknown operator"	
-  in
-  let rec compile' env scode = failwith "Not implemented" in
-  compile' env code
+  | _    -> failwith "unknown operator"
+
+let in_mem = function
+  | S _ | M _ -> true
+  | _   -> false
+
+let mov (a, b) = if in_mem a && in_mem b then [Mov (a, eax); Mov (eax, b)] else [Mov (a, b)]
+
+let binop (op, a, b) = if in_mem a && in_mem b then [Mov (b, eax); Binop (op, a, eax); Mov (eax, b)] else [Binop (op, a, b)]
+
+let rec compile' env = function
+  | READ     -> let s, env' = env#allocate in (env', [Call "Lread"; Mov (eax, s)])
+  | WRITE    -> let s, env' = env#pop in      (env', [Push s; Call "Lwrite"; Pop eax])
+  | CONST n  -> let s, env' = env#allocate in (env', [Mov (L n, s)])
+  | LD x     -> let s, env' = (env#global x)#allocate in (env', mov (env'#loc x, s))
+  | ST x     -> let s, env' = (env#global x)#pop in (env', mov (s, env'#loc x))
+  | BINOP op ->
+    let x, y, env = env#pop2 in
+    let s, env = env#allocate in
+    (match op with
+     | "+" | "-" | "*" -> env, binop (op, x, y) @ mov (y, s)
+     | "&&" | "!!" ->
+       env, [Binop ("^", eax, eax); Binop ("^", edx, edx);
+             Binop ("cmp", L 0, x); Set ("nz", "%al");
+             Binop ("cmp", L 0, y); Set ("nz", "%dl");
+             Binop (op, eax, edx); Mov (edx, s)]
+     | "/" -> env, [Mov (y, eax); Cltd; IDiv x; Mov (eax, s)]
+     | "%" -> env, [Mov (y, eax); Cltd; IDiv x; Mov (edx, s)]
+     | "<" | "<=" | ">" | ">=" | "==" | "!=" ->
+       env, binop ("cmp", x, y) @ [Mov (L 0, eax); Set ((suffix op), "%al"); Mov(eax, s)])
+  | LABEL s     -> env, [Label s]
+  | JMP   l     -> env, [Jmp l]
+  | CJMP (s, l) ->
+    let x, env = env#pop in
+    env, [Binop ("cmp", L 0, x); CJmp  (s, l)]
+  | BEGIN (f, a, l) ->
+    let env = env#enter f a l in
+    env, [Push ebp; Mov (esp, ebp); Binop ("-", M ("$" ^ env#lsize), esp)]
+  | END ->
+    env, [Label env#epilogue;
+          Mov (ebp, esp);
+          Pop ebp;
+          Ret;
+          Meta (Printf.sprintf "\t.set\t%s, \t%d" env#lsize (env#allocated * word_size))]
+  | RET b ->
+    if b
+    then let x, env = env#pop in env, [Mov (x, eax); Jmp env#epilogue]
+    else env, [Jmp env#epilogue]
+  | CALL (f, n, p) ->
+    let pushr = List.map (fun r -> Push r) env#live_registers in
+    let popr =  List.map (fun r -> Pop r) @@ List.rev env#live_registers in
+    let rec push_args env acc = function
+    | 0 -> env, acc
+    | v -> let x, env = env#pop in push_args env ((Push x)::acc) (v - 1)
+    in
+    let env, pushs = push_args env [] n in
+    let pushs = List.rev pushs in
+
+    let env, res = if p then env, [] else (let y, env = env#allocate in env, [Mov (eax, y)]) in
+    env, pushr @ pushs @ [Call f; Binop ("+", L (n * word_size), esp)] @ popr @ res
+
+let rec compile env = function
+| instr :: scode' ->
+  let env',  code'  = compile' env  instr  in
+  let env'', code'' = compile  env' scode' in
+  env'', code' @ code''
+| [] -> env, []
 
 (* A set of strings *)           
 module S = Set.Make (String)
 
+let init n f =
+  let rec init' i n f =
+    if i >= n then []
+    else (f i) :: (init' (i + 1) n f)
+  in init' 0 n f
+
 (* Environment implementation *)
-let make_assoc l = List.combine l (List.init (List.length l) (fun x -> x))
+let make_assoc l = List.combine l (init (List.length l) (fun x -> x))
                      
 class env =
   object (self)

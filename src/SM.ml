@@ -39,7 +39,37 @@ let split n l =
   in
   unzip ([], l) n
         
-let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) prg = failwith "Not implemented"
+let check_jmp s e =
+    match s with
+    | "z"  -> e = 0
+    | "nz" -> e != 0
+
+let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) = function
+  | [] -> conf
+  | insn :: prg' ->
+    (match insn with
+      | BINOP op    -> let y::x::stack' = stack in eval env (cstack, Expr.to_func op x y :: stack', c) prg'
+      | READ        -> let z::i'        = i     in eval env (cstack, z::stack, (st, i', o)) prg'
+      | WRITE       -> let z::stack'    = stack in eval env (cstack, stack', (st, i, o @ [z])) prg'
+      | CONST i     -> eval env (cstack, i::stack, c) prg'
+      | LD x        -> eval env (cstack, State.eval st x :: stack, c) prg'
+      | ST x        -> let z::stack'    = stack in eval env (cstack, stack', (State.update x z st, i, o)) prg'
+      | LABEL _     -> eval env conf prg'
+      | JMP l       -> eval env conf (env#labeled l)
+      | CJMP (s, l) ->
+        let z::stack' = stack in
+        if (check_jmp s z) then eval env (cstack, stack', c) (env#labeled l) else eval env (cstack, stack', c) prg'
+      | CALL (f, _, _) -> eval env ((prg', st)::cstack, stack, c) (env#labeled f)
+      | BEGIN (_, a, l) ->
+        let (st', stack') = List.fold_right (fun a (st, x::stack') -> (
+          State.update a x st, stack')) a (State.enter st (a @ l), stack) in
+        eval env (cstack, stack', (st', i, o)) prg'
+      | END | RET _ ->
+        (match cstack with
+        | [] -> conf
+        | (p, st')::cstack' -> eval env (cstack', stack, (State.leave st st', i, o)) p
+        )
+    )
 
 (* Top-level evaluation
 
@@ -81,4 +111,56 @@ let run p i =
    Takes a program in the source language and returns an equivalent program for the
    stack machine
 *)
-let compile (defs, p) = failwith "Not implemented"
+
+class env =
+    object(self)
+        val cnt = 0
+        method next_label = "l" ^ string_of_int cnt, {<cnt = cnt + 1>}
+    end
+
+let funl f = "l" ^ f
+
+let rec compile' env =
+  let rec expr = function
+  | Expr.Var   x          -> [LD x]
+  | Expr.Const n          -> [CONST n]
+  | Expr.Binop (op, x, y) -> expr x @ expr y @ [BINOP op]
+  | Expr.Call (f, args)   -> List.concat (List.map expr args) @ [CALL (funl f, List.length args, false)]
+  in
+  function
+  | Stmt.Seq (s1, s2)  ->
+        let env, cfg = compile' env s1 in
+        let env, cfg' = compile' env s2 in
+        env, cfg @ cfg'
+  | Stmt.Read x        -> env, [READ; ST x]
+  | Stmt.Write e       -> env, expr e @ [WRITE]
+  | Stmt.Assign (x, e) -> env, expr e @ [ST x]
+  | Stmt.Skip          -> env, []
+  | Stmt.If (e, s1, s2)->
+        let lelse, env = env#next_label in
+        let lfi, env = env#next_label in
+        let env, compiled_then = compile' env s1 in
+        let env, compiled_else = compile' env s2 in
+        env, (expr e @ [CJMP ("z", lelse)] @ compiled_then @ [JMP lfi] @ [LABEL lelse] @ compiled_else @ [LABEL lfi])
+  | Stmt.While (e, s)  ->
+        let lch, env = env#next_label in
+        let llp, env = env#next_label in
+        let env, compiled_lp = compile' env s in
+        env, ([JMP lch] @ [LABEL llp] @ compiled_lp @ [LABEL lch] @ expr e @ [CJMP ("nz", llp)])
+  | Stmt.Repeat (s, e) ->
+        let llp, env = env#next_label in
+        let env, compiled_lp = compile' env s in
+        env, ([LABEL llp] @ compiled_lp @ expr e @ [CJMP ("z", llp)])
+  | Stmt.Call (f, args) ->
+        let comp_args = List.concat (List.map expr args) in
+        env, comp_args @ [CALL (funl f, List.length args, true)]
+  | Stmt.Return e -> env, (match e with None -> [RET false] | Some e -> expr e @ [RET true])
+
+let compile_def env (f, (args, locals, body)) =
+    let env, res = compile' env body in
+    let name = funl f in
+    [LABEL name; BEGIN (name, args, locals)] @ res @ [END]
+
+let compile (defs, p) =
+    let env', comp_prg = compile' (new env) p in
+	comp_prg @ [END] @ List.concat (List.map (compile_def env') defs)
