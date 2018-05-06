@@ -108,8 +108,6 @@ let mov (a, b) = if in_mem a && in_mem b then [Mov (a, eax); Mov (eax, b)] else 
 let binop (op, a, b) = if in_mem a && in_mem b then [Mov (b, eax); Binop (op, a, eax); Mov (eax, b)] else [Binop (op, a, b)]
 
 let rec compile' env = function
-  | READ     -> let s, env' = env#allocate in (env', [Call "Lread"; Mov (eax, s)])
-  | WRITE    -> let s, env' = env#pop in      (env', [Push s; Call "Lwrite"; Pop eax])
   | CONST n  -> let s, env' = env#allocate in (env', [Mov (L n, s)])
   | LD x     -> let s, env' = (env#global x)#allocate in (env', mov (env'#loc x, s))
   | ST x     -> let s, env' = (env#global x)#pop in (env', mov (s, env'#loc x))
