@@ -49,7 +49,42 @@ let split n l =
   in
   unzip ([], l) n
           
-let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) _ = failwith "Not yet implemented"
+let check_jmp s e =
+  match s with
+  | "z"  -> e = 0
+  | "nz" -> e != 0
+
+let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) = function
+  | [] -> conf
+  | insn :: prg' ->
+  (match insn with
+    | BINOP op    -> let y::x::stack' = stack in
+      eval env (cstack, (Value.of_int (Expr.to_func op (Value.to_int x) (Value.to_int y)))::stack', c) prg'
+    | CONST i     -> eval env (cstack, (Value.of_int i)::stack, c) prg'
+    | STRING s    -> eval env (cstack, (Value.of_string s)::stack, c) prg'
+    | LD x        -> eval env (cstack, (State.eval st x ) :: stack, c) prg'
+    | ST x        -> let z::stack'    = stack in eval env (cstack, stack', (State.update x z st, i, o)) prg'
+    | STA (x, n)  -> let v::is, stack' = split (n + 1) stack in
+                     eval env (cstack, stack', (Language.Stmt.update st x v (List.rev is), i , o)) prg'
+    | LABEL l     -> eval env conf prg'
+    | JMP l       -> eval env conf (env#labeled l)
+    | CJMP (s, l) ->
+      let z::stack' = stack in
+      if (check_jmp s (Value.to_int z)) then eval env (cstack, stack', c) (env#labeled l) else eval env (cstack, stack', c) prg'
+    | CALL (f, n, p) ->
+      if env#is_label f
+      then eval env ((prg', st)::cstack, stack, c) (env#labeled f)
+      else eval env (env#builtin conf f n p) prg'
+    | BEGIN (_, a, l) ->
+      let (st', stack') = List.fold_right (fun a (st, x::stack') -> (
+        State.update a x st, stack')) a (State.enter st (a @ l), stack) in
+      eval env (cstack, stack', (st', i, o)) prg'
+    | END | RET _ ->
+      (match cstack with
+      | [] -> conf
+      | (p, st')::cstack' -> eval env (cstack', stack, (State.leave st st', i, o)) p
+      )
+  )
 
 (* Top-level evaluation
 
