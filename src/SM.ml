@@ -65,7 +65,7 @@ let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) = function
     | LD x        -> eval env (cstack, (State.eval st x ) :: stack, c) prg'
     | ST x        -> let z::stack'    = stack in eval env (cstack, stack', (State.update x z st, i, o)) prg'
     | STA (x, n)  -> let v::is, stack' = split (n + 1) stack in
-                     eval env (cstack, stack', (Language.Stmt.update st x v (List.rev is), i , o)) prg'
+                     eval env (cstack, stack', (Language.Stmt.update st x v (List.rev is ), i , o)) prg'
     | LABEL l     -> eval env conf prg'
     | JMP l       -> eval env conf (env#labeled l)
     | CJMP (s, l) ->
@@ -84,6 +84,22 @@ let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) = function
       | [] -> conf
       | (p, st')::cstack' -> eval env (cstack', stack, (State.leave st st', i, o)) p
       )
+    | SEXP (tag, n) ->
+      let elems, stack' = split n stack in
+      eval env (cstack, (Value.sexp tag @@ List.rev elems)::stack', c) prg'
+    | DROP -> eval env (cstack, List.tl stack, c) prg'
+    | DUP -> eval env (cstack, List.hd stack :: stack, c) prg'
+    | SWAP ->
+      let x::y::stack' = stack in
+      eval env (cstack, y::x::stack', c) prg'
+    | TAG t ->
+      let x::stack' = stack in
+      eval env (cstack, (Value.of_int @@ match x with Value.Sexp (t', _) when t' = t -> 1 | _ -> 0) :: stack', c) prg'
+    | ENTER xs ->
+      let vs, stack' = split (List.length xs) stack in
+      let state' = List.fold_left2 (fun s x v -> State.bind x v s) State.undefined xs vs in
+      eval env (cstack, stack', (State.push st state' xs, i, o)) prg'
+    | LEAVE -> eval env (cstack, stack, (State.drop st, i, o)) prg'
   )
 
 (* Top-level evaluation
@@ -131,11 +147,78 @@ let compile (defs, p) =
   let label s = "L" ^ s in
   let rec call f args p =
     let args_code = List.concat @@ List.map expr args in
-    args_code @ [CALL (label f, List.length args, p)]
-  and pattern lfalse _ = failwith "Not implemented"
-  and bindings p = failwith "Not implemented"
-  and expr e = failwith "Not implemented" in
-  let rec compile_stmt l env stmt =  failwith "Not implemented" in
+    args_code @ [CALL (f, List.length args, p)]
+  and pattern lfalse = function
+    | Stmt.Pattern.Wildcard -> false, [DROP]
+    | Stmt.Pattern.Ident n -> false, [DROP]
+    | Stmt.Pattern.Sexp (t, ps) -> true, [DUP; TAG t; CJMP ("z", lfalse)] @
+       (List.concat @@ List.mapi
+         (fun i pr -> [DUP; CONST i; CALL (".elem", 2, false)] @ (snd @@ pattern lfalse pr))
+          ps)
+  and bindings p =
+    let rec inner = function
+    | Stmt.Pattern.Wildcard -> [DROP]
+    | Stmt.Pattern.Ident n -> [SWAP]
+    | Stmt.Pattern.Sexp (_, ps) -> (List.concat @@ List.mapi (fun i p -> [DUP; CONST i; CALL (".elem", 2, false)] @ inner p) ps) @ [DROP]
+    in
+    inner p @ [ENTER (Stmt.Pattern.vars p)]
+  and expr = function
+    | Expr.Var   x          -> [LD x]
+    | Expr.Const n          -> [CONST n]
+    | Expr.String s         -> [STRING s]
+    | Expr.Binop (op, x, y) -> expr x @ expr y @ [BINOP op]
+    | Expr.Call (f, args)   -> call f args false
+    | Expr.Array arr        -> List.concat (List.map expr arr)  @ [CALL (".array", List.length arr, false)]
+    | Expr.Sexp (t, xs)     -> List.concat (List.map expr xs)   @ [SEXP (t, List.length xs)]
+    | Expr.Elem (a, i)      -> expr a @ expr i @ [CALL (".elem", 2, false)]
+    | Expr.Length e         -> expr e @ [CALL (".length", 1, false)]
+  in
+  let rec compile_stmt l env = function
+   | Stmt.Seq (s1, s2)      ->
+     let l2, env = env#get_label in
+     let env, flag1, cfg = compile_stmt l2 env s1 in
+     let env, flag2, cfg' = compile_stmt l env s2 in
+     env, flag2, cfg @ (if flag1 then [LABEL l2] else []) @ cfg'
+   | Stmt.Assign (x, [], e) -> env, false, expr e @ [ST x]
+   | Stmt.Assign (x, is, e) ->
+     env, false, List.concat (List.map expr (is @ [e])) @ [STA (x, List.length is)]
+   | Stmt.Skip              -> env, false, []
+   | Stmt.If (e, s1, s2)    ->
+     let l2, env = env#get_label in
+     let env, flag1, compiled_then = compile_stmt l env s1 in
+     let env, flag2, compiled_else = compile_stmt l env s2 in
+     env, true, (expr e @ [CJMP ("z", l2)] @ compiled_then @ (if flag1 then [] else [JMP l]) @ [LABEL l2] @ compiled_else @ (if flag2 then [] else [JMP l]))
+   | Stmt.While (e, s)      ->
+     let lch, env = env#get_label in
+     let llp, env = env#get_label in
+     let env, _, compiled_lp = compile_stmt lch env s in
+     env, false, ([JMP lch; LABEL llp] @ compiled_lp @ [LABEL lch] @ expr e @ [CJMP ("nz", llp)])
+   | Stmt.Repeat (s, e)     ->
+     let lch, env = env#get_label in
+     let llp, env = env#get_label in
+     let env, flag, compiled_lp = compile_stmt lch env s in
+     env, false, [LABEL llp] @ compiled_lp @ (if flag then [LABEL lch] else []) @ (expr e) @ [CJMP ("z", llp)]
+   | Stmt.Call (f, args)    ->
+     env, false, call f args true
+   | Stmt.Return e -> env, false, (match e with None -> [RET false] | Some e -> expr e @ [RET true])
+   | Stmt.Leave -> env, false, [LEAVE]
+   | Stmt.Case (e, [p, s])  ->
+     let pflag, pcode = pattern l p in
+     let env, cflag, scode = compile_stmt l env (Stmt.Seq (s, Stmt.Leave)) in
+     env, pflag || cflag, expr e @ bindings p @ scode
+   | Stmt.Case (e, branches)     ->
+     let n = List.length branches - 1 in
+     let env, _, _, code =
+       List.fold_left
+         (fun (env, labl, i, cod) (p, s) ->
+           let (lfalse, env), jmp = if i = n then (l, env), [] else env#get_label, [JMP l] in
+           let _, pcode = pattern lfalse p in
+           let env, _, scode = compile_stmt l env (Stmt.Seq (s, Stmt.Leave)) in
+           (env, Some lfalse, i + 1, ((match labl with None -> [] | Some l -> [LABEL l]) @ pcode @ bindings p @ scode @ jmp) :: cod))
+         (env, None, 0, []) branches
+     in
+     env, true, expr e @ List.concat @@ List.rev code
+  in
   let compile_def env (name, (args, locals, stmt)) =
     let lend, env       = env#get_label in
     let env, flag, code = compile_stmt lend env stmt in
@@ -153,7 +236,7 @@ let compile (defs, p) =
   in
   let env, def_code =
     List.fold_left
-      (fun (env, code) (name, others) -> let env, code' = compile_def env (label name, others) in env, code'::code)
+      (fun (env, code) (name, others) -> let env, code' = compile_def env (name, others) in env, code'::code)
       (env, [])
       defs
   in

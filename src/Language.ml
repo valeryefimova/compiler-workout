@@ -34,8 +34,14 @@ module Value =
     | Sexp (t, _) -> t
     | _ -> failwith "symbolic expression expected"
 
+    let init n f =
+      let rec init' i n f =
+        if i >= n then []
+        else (f i) :: (init' (i + 1) n f)
+      in init' 0 n f
+
     let update_string s i x = String.init (String.length s) (fun j -> if j = i then x else s.[j])
-    let update_array  a i x = List.init   (List.length a)   (fun j -> if j = i then x else List.nth a j)
+    let update_array  a i x = init   (List.length a)   (fun j -> if j = i then x else List.nth a j)
 
   end
        
@@ -185,6 +191,10 @@ module Expr =
       | "!!" -> fun x y -> bti (itb x || itb y)
       | _    -> failwith (Printf.sprintf "Unknown binary operator %s" op)    
     
+    let some_to_list = function
+      | None -> []
+      | Some x -> x
+
     let rec eval env ((st, i, o, r) as conf) expr =
       match expr with
       | Const n -> (st, i, o, Some (Value.of_int n))
@@ -202,13 +212,16 @@ module Expr =
         env#definition env f (List.rev eargs) conf
       | Array arr ->
         let (st, i, o, vs) = eval_list env conf arr in
-        env#definition env "$array" vs (st, i, o, None)
+        env#definition env ".array" vs (st, i, o, None)
       | Length e ->
         let (st, i, o, Some args) = eval env conf e in
-        env#definition env "$length" [args] (st, i, o, None)
+        env#definition env ".length" [args] (st, i, o, None)
       | Elem (b, i) ->
         let (st, i, o, args) = eval_list env conf [b; i] in
-        env#definition env "$elem" args (st, i, o, None)
+        env#definition env ".elem" args (st, i, o, None)
+      | Sexp (tag, arr) ->
+        let (st, i, o, vs) = eval_list env conf arr in
+         (st, i, o, Some (Value.Sexp (tag, vs)))
     and eval_list env conf xs =
       let vs, (st, i, o, _) =
         List.fold_left
@@ -252,6 +265,7 @@ module Expr =
       | c:CHAR    {Const (Char.code c)}
       | "[" elems:!(Util.list0)[parse] "]" {Array elems}
       | x:IDENT   s:("(" args:!(Util.list0)[parse] ")" {Call (x, args)} | empty {Var x}) {s}
+      | "`" tag:IDENT args:(-"(" !(Util.list0)[parse] -")")? {Sexp (tag, some_to_list args)}
       | -"(" parse -")"
     )
     
@@ -274,7 +288,10 @@ module Stmt =
 
         (* Pattern parser *)                                 
         ostap (
-          parse: empty {failwith "Not implemented"}
+          parse:
+              %"_" {Wildcard}
+              | "`" tag:IDENT args:(-"(" !(Util.list)[parse] -")")? {Sexp (tag, Expr.some_to_list args)}
+              | x:IDENT {Ident x}
         )
         
         let vars p =
@@ -320,6 +337,7 @@ module Stmt =
         | Skip, s2 -> s2
         | s1, s2   -> Seq (s1, s2) in
       match stmt with
+        | Leave             -> eval env (State.drop st, i, o, r) Skip k
         | Assign (x, is, e) ->
           let (st, i, o, is) = Expr.eval_list env conf is in
           let (st, i, o, Some v) = Expr.eval env (st, i, o, None) e in
@@ -338,8 +356,32 @@ module Stmt =
             (match e with
             | None -> (st, i, o, None)
             | Some e -> Expr.eval env conf e)
-        | Call (f, args)  ->
-            eval env (Expr.eval env conf (Expr.Call (f, args))) k Skip
+        | Call (f, args)  -> eval env (Expr.eval env conf (Expr.Call (f, args))) k Skip
+        | Case (e, branches)    ->
+           let (_, _, _, Some v) as conf' = Expr.eval env conf e in
+           let rec branch ((st, i, o, _) as conf) = function
+             | [] -> failwith "Pattern matching failed"
+             | (pattern, body)::tl ->
+               let rec match_pattern pattern v st =
+                 let update x v = function
+                 | None -> None
+                 | Some s -> Some (State.bind x v s) in
+               match pattern, v with
+               | Pattern.Ident x,  v -> update x v st
+               | Pattern.Wildcard, _ -> st
+               | Pattern.Sexp (t, ps), Value.Sexp(t', vs) when t = t' -> match_list ps vs st
+               | _ -> None
+               and match_list ps vs s =
+                 match ps, vs with
+                 | [], [] -> s
+                 | p::ps, v::vs -> match_list ps vs (match_pattern p v s)
+                 | _ -> None
+               in
+               match match_pattern pattern v (Some State.undefined) with
+               | None -> branch conf tl
+               | Some st' -> eval env (State.push st st' (Pattern.vars pattern), i, o, None) k (Seq (body, Leave))
+           in
+           branch conf' branches
         | _ -> failwith "Unknown"
                                                         
     (* Statement parser *)
@@ -370,6 +412,7 @@ module Stmt =
      | %"for" s1:parse "," e:!(Expr.parse) "," s2:parse %"do" s3:parse %"od" {Seq (s1, While (e, Seq (s3, s2)))}
      | %"repeat" s:parse %"until" e:!(Expr.parse) {Repeat (s, e)}
      | %"return" e:!(Expr.parse)? {Return e}
+     | %"case" e:!(Expr.parse) %"of" branches: !(Util.listBy) [ostap ("|")] [ostap (!(Pattern.parse) -"->" parse)] %"esac" {Case (e, branches)}
      | x:IDENT is:(-"[" !(Expr.parse) -"]")* ":=" e:!(Expr.parse) {Assign (x, is, e)}
      | f:IDENT "(" args:!(Util.list0)[Expr.parse] ")" {Call (f, args)}
    )
